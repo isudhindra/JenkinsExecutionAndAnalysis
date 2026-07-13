@@ -200,6 +200,18 @@ def _local_token_401(message: str):
     return resp, 401
 
 
+def upstream_jenkins_error_response(exc: Exception, default_status: int = 500):
+    """Translate a JenkinsClientError into a Flask (jsonify, status) tuple.
+    When Jenkins itself returned 401, emit 401 with NO X-RACE-Auth-Error header
+    so the browser shows the amber upstream banner, not the red local-token one.
+    """
+    from race.lib.credentials import safe_err  # local import → no cycle
+    status = getattr(exc, "status_code", None)
+    if status == 401:
+        return jsonify({"error": safe_err(exc), "auth_error_kind": "upstream-jenkins"}), 401
+    return jsonify({"error": safe_err(exc)}), default_status
+
+
 def install_local_api_token_guard(app: Flask) -> None:
     """Require X-RACE-Token on every /api/* call (or ?token= for SSE).
     Keeps other local processes off the API; /api/config is exempt.

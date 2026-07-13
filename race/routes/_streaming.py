@@ -131,7 +131,7 @@ def _stream_pipeline(
     Aborts when operation_id is superseded; clear_store/compute_full_stats toggle caller behaviour.
     """
     if clear_store:
-        state.job_store.clear()
+        state.job_store_clear()
 
     start_time = time.time()
     event_queue: queue.Queue = queue.Queue()
@@ -177,7 +177,7 @@ def _stream_pipeline(
         if event.event_type == SSEEventType.JOB_METADATA:
             record = find_record_from_event(event, orchestrator)
             if record:
-                state.job_store[event.job_id] = record
+                state.job_store_set(event.job_id, record)
                 stage_1_records.append(record)
             yield format_sse({
                 "event_type": "job_metadata",
@@ -187,9 +187,17 @@ def _stream_pipeline(
 
         elif event.event_type == SSEEventType.JOB_ERROR:
             error_record = create_error_record(event)
-            state.job_store[event.job_id] = error_record
+            state.job_store_set(event.job_id, error_record)
             yield format_sse({
                 "event_type": "job_error",
+                "operation_id": event.operation_id,
+                **event.payload,
+            })
+
+        elif event.event_type == SSEEventType.AUTH_ERROR:
+            # Stream-level, no per-job record — frontend raises the amber banner.
+            yield format_sse({
+                "event_type": "auth_error",
                 "operation_id": event.operation_id,
                 **event.payload,
             })
@@ -207,8 +215,9 @@ def _stream_pipeline(
     #  Stage 2 --
     # Full fetch scans the whole store; refresh stays within this round's records.
     if compute_full_stats:
+        snapshot = state.job_store_snapshot()
         failed_records = [
-            r for r in state.job_store.values()
+            r for r in snapshot.values()
             if r.health_state in (HealthState.FAILED, HealthState.UNSTABLE)
         ]
     else:
@@ -244,13 +253,12 @@ def _stream_pipeline(
 
             if event.event_type == SSEEventType.JOB_ENRICHED:
                 # Re-serialise via to_dict so release_status reflects the in-place mutation.
-                if event.job_id in state.job_store:
+                enriched = state.job_store_get(event.job_id)
+                if enriched is not None:
                     yield format_sse({
                         "event_type": "job_enriched",
                         "operation_id": event.operation_id,
-                        **state.job_store[event.job_id].to_dict(
-                            promotion_time=orchestrator.promotion_time,
-                        ),
+                        **enriched.to_dict(promotion_time=orchestrator.promotion_time),
                     })
                 else:
                     yield format_sse({
@@ -272,10 +280,12 @@ def _stream_pipeline(
     duration = time.time() - start_time
 
     if compute_full_stats:
-        total = len(state.job_store)
-        failed = sum(1 for r in state.job_store.values() if r.health_state == HealthState.FAILED)
-        unstable = sum(1 for r in state.job_store.values() if r.health_state == HealthState.UNSTABLE)
-        classified = sum(1 for r in state.job_store.values() if r.classification is not None)
+        # Single locked snapshot — every count below sees the same consistent view.
+        snapshot = state.job_store_snapshot()
+        total = len(snapshot)
+        failed = sum(1 for r in snapshot.values() if r.health_state == HealthState.FAILED)
+        unstable = sum(1 for r in snapshot.values() if r.health_state == HealthState.UNSTABLE)
+        classified = sum(1 for r in snapshot.values() if r.classification is not None)
         yield format_sse({
             "event_type": "fetch_complete",
             "operation_id": operation_id,

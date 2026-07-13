@@ -63,6 +63,9 @@ TEMPLATES_DIR = PROJECT_ROOT / "templates"
 STATIC_DIR = PROJECT_ROOT / "static"
 CONFIG_DIR = PROJECT_ROOT / "config"
 
+# Set by _ensure_local_api_token when the on-disk token write fails
+_LAST_TOKEN_FINGERPRINT_IN_MEMORY = ""
+
 
 def create_app() -> Flask:
     """Build the Flask app, load the classifier and contexts.json, and register every blueprint.
@@ -101,6 +104,9 @@ def create_app() -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
     app.config["LOCAL_API_TOKEN"] = _ensure_local_api_token()
+    # Surface in-memory-token state via /api/config so the dashboard 
+    app.config["LOCAL_API_TOKEN_FINGERPRINT"] = _LAST_TOKEN_FINGERPRINT_IN_MEMORY or ""
+    app.config["LOCAL_API_TOKEN_IN_MEMORY"] = bool(_LAST_TOKEN_FINGERPRINT_IN_MEMORY)
 
     from race.lib.security import install_security_headers, install_local_api_token_guard
     install_security_headers(app)
@@ -201,6 +207,27 @@ def _ensure_local_api_token() -> str:
         except FileNotFoundError:
             os.mkdir(str(race_dir), mode=0o700)
 
+        # Acquire an exclusive flock on a sibling lock file before touching
+        # the token. If a second RACE process is already running, fall back
+        # to an in-memory token for THIS process so we never overwrite the
+        # primary's on-disk token (which would silently 401 its browsers).
+        lock_path = race_dir / ".lock"
+        try:
+            import fcntl  # POSIX-only; Windows tolerates the missing module via except below
+            lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(lock_fd)
+                raise RuntimeError(
+                    f"Another RACE process already holds {lock_path}. "
+                    f"Stop it first or use a different HOME — this process "
+                    f"will run with an in-memory token only."
+                )
+        except ImportError:
+            # Windows: no fcntl — skip the lock; single-user race remains rare.
+            pass
+
         # Inspect any existing token file. NEVER blindly unlink a symlink or
         # wrong-owned file — surface the anomaly instead so the user sees it.
         try:
@@ -268,6 +295,8 @@ def _ensure_local_api_token() -> str:
         import hashlib
         token = secrets.token_hex(32)
         fp = hashlib.sha256(token.encode()).hexdigest()[:8]
+        global _LAST_TOKEN_FINGERPRINT_IN_MEMORY
+        _LAST_TOKEN_FINGERPRINT_IN_MEMORY = f"sha256:{fp}"
         print(
             f"[WARN] {token_file} unavailable ({e}); using an in-memory token "
             f"for this session — fingerprint=sha256:{fp}. curl / CI scripts "

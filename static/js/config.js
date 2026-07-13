@@ -30,6 +30,11 @@ function onInstanceChange() {
     const customGroup = document.getElementById('custom-url-group');
     const customInput = document.getElementById('cfg-custom-url');
 
+    // Capture the previously-selected instance so we can detect a genuine
+    // switch and drop stale Env-A rows before the new env's promotion-time
+    // recompute marks them all NA.
+    const prevInstance = appState.selectedInstance ? appState.selectedInstance.jenkins_url : null;
+
     if (select.value === '__custom__') {
         customGroup.classList.add('cfg-custom-url-visible');
         setTimeout(function() { customInput.focus(); }, 80);
@@ -46,6 +51,65 @@ function onInstanceChange() {
                 document.getElementById('cfg-username').value = appState.selectedInstance.default_username;
             }
         }
+    }
+
+    // Genuine instance switch with jobs on screen → drop them so the recompute
+    // doesn't briefly badge Env-A rows with Env-B's promotion. User must
+    // re-click Fetch to load Env-B's data.
+    const newInstance = appState.selectedInstance ? appState.selectedInstance.jenkins_url : null;
+    if (prevInstance && newInstance && prevInstance !== newInstance
+        && appState.jobs && appState.jobs.size > 0) {
+        // Abort any in-flight SSE fetch
+        if (appState._fetchAbortController) {
+            try { appState._fetchAbortController.abort(); } catch (_) { /* already aborted */ }
+            appState._fetchAbortController = null;
+        }
+        // Stop the auto-refresh poller so it doesn't tick against Env URLs
+        // during the transition.
+        if (typeof _stopAutoRefresh === 'function') {
+            _stopAutoRefresh('env-switch');
+            if (typeof _setAutoRefreshOn === 'function') _setAutoRefreshOn(false);
+            if (typeof _updateAutoRefreshButton === 'function') _updateAutoRefreshButton(false);
+        }
+
+        appState.jobs.clear();
+        const tbody = document.querySelector('#job-table tbody');
+        if (tbody) tbody.innerHTML = '';
+        if (appState.rowEls) appState.rowEls.clear();
+        if (appState.detailRowEls) appState.detailRowEls.clear();
+        if (appState.statusTransitions) appState.statusTransitions.clear();
+
+        // Clear all Env carryover state — selection, rerun badges, refresh
+        // stamps, expansions 
+        if (appState.selectedJobs) appState.selectedJobs.clear();
+        if (appState.rerunStates) appState.rerunStates.clear();
+        if (appState.lastRefreshTimes) appState.lastRefreshTimes.clear();
+        if (appState.expandedRows) appState.expandedRows.clear();
+        appState.currentViewUrl = null;
+
+        // Reset filter chip inputs so Env-B doesn't inherit Env-A's active
+        // filters silently.
+        var fs = document.getElementById('filter-status');
+        if (fs) fs.value = '';
+        var frs = document.getElementById('filter-release-status');
+        if (frs) frs.value = '';
+        var fsearch = document.getElementById('filter-search');
+        if (fsearch) fsearch.value = '';
+        if (typeof clearLogAnalysisFilter === 'function') {
+            try { clearLogAnalysisFilter(); } catch (_) { /* keep going */ }
+        }
+        appState.filters = {
+            status: null, searchText: '', logAnalysisLabels: [],
+            releaseStatus: null, _searchRe: null,
+        };
+
+        var allCb = document.getElementById('select-all-checkbox');
+        if (allCb) { allCb.checked = false; allCb.indeterminate = false; }
+
+        if (typeof updateSummaryBar === 'function') updateSummaryBar();
+        if (typeof updateEmptyState === 'function') updateEmptyState();
+        if (typeof updateToolbarActions === 'function') updateToolbarActions();
+        if (typeof updateClearFiltersButton === 'function') updateClearFiltersButton();
     }
 
     resetViewStep();

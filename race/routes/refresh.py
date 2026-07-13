@@ -33,7 +33,7 @@ def _resolve_poll_workers() -> int:
                 return n
         except ValueError:
             pass
-    return 15
+    return 24
 
 
 _POLL_MAX_WORKERS = _resolve_poll_workers()
@@ -90,7 +90,7 @@ def refresh_stream():
     # Rebuild {name, url} dicts from URLs, reusing names already in the store.
     jobs_for_refresh = []
     for job_url in target_jobs:
-        existing = state.job_store.get(job_url)
+        existing = state.job_store_get(job_url)
         job_name = existing.job_name if existing else job_url.rstrip("/").split("/")[-1]
         jobs_for_refresh.append({"name": job_name, "url": job_url})
 

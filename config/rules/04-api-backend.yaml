@@ -3,16 +3,31 @@
 # because it usually means a real product regression worth blocking release.
 
 rules:
+  # Specific phrasing: multi-criteria timeline lookup that drives "assign
+  # application to examiner". Higher priority than the generic rule below.
+  - name: "unable_to_assign_application"
+    priority: 3
+    domain: "API / Backend Service"
+    subcategory: "Unable to Assign Application"
+    impact: "Product Regression Likely"
+    label: "UNABLE_TO_ASSIGN_APPLICATION"
+    patterns:
+      - "Unable to find timeline event defined by \\["
+    action: "The expected combination of timeline events for application assignment was not produced. Check the application-workflow service: check-group events, resolution-required event, and APPLICATION_AWAITING_EXAMINATION publication."
+    scope: "global"
+
   - name: "timeline_event_not_found"
     priority: 5
     domain: "API / Backend Service"
     subcategory: "Timeline Event Missing"
     impact: "Product Regression Likely"
     label: "Timeline Event Missing"
+    # Per-result display: "EVENT_MISSING: <event>" — separates chips/filters by event.
+    label_template: "EVENT_MISSING: {detail}"
     patterns:
       - "Unable to find timeline event"
       - "Timeline event:.*not found within"
-    
+
     # Extract the missing event name(s)
     extract_pattern: "(?:Unable to find timeline event '(?P<event_single>[^']+)'|Timeline event: (?P<event_timeout>[A-Za-z0-9_]+) not found|Unable to find timeline event defined by (?P<event_composite>\\[[^\\]]+\\]))"
     action: "Backend did not emit the expected event in time. Check the producing service (application, payment, document) and the event bus for delays, dropped messages, or a regression in the event publication flow."

@@ -16,8 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
 
-# Single source of truth for concurrent-fetch defaults 
-DEFAULT_WORKERS = 24
+DEFAULT_WORKERS = 35
 MIN_WORKERS = 1
 MAX_WORKERS = 64
 
@@ -152,6 +151,10 @@ class Classifier:
 
         evidence = self._extract_evidence(normalized, primary_line_num, context_lines=5)
 
+        # Evidence detail must be computed before label aggregation
+        evidence_detail = self._extract_detail(primary_rule, normalized)
+        primary_display_label = self._format_display_label(primary_rule, evidence_detail)
+
         # Aggregate labels
         CATCHALL_PRIORITY = 500
         has_specific = any(r.priority < CATCHALL_PRIORITY for r, _, _ in matches)
@@ -161,12 +164,13 @@ class Classifier:
         seen_domains: set = set()
 
         for rule, _, _ in matches:
-            
+
             if has_specific and rule.priority >= CATCHALL_PRIORITY:
                 continue
             if rule.domain in seen_domains:
                 continue
-            lbl = rule.label or rule.subcategory
+            # Primary rule gets the templated label;
+            lbl = primary_display_label if rule is primary_rule else (rule.label or rule.subcategory)
             if lbl in seen_labels:
                 continue
             seen_labels.add(lbl)
@@ -178,9 +182,6 @@ class Classifier:
                 rule_name=rule.name,
             ))
 
-        # If the primary rule defines an extract_pattern
-        evidence_detail = self._extract_detail(primary_rule, normalized)
-
         return ClassificationResult(
             primary_domain=primary_rule.domain,
             subcategory=primary_rule.subcategory,
@@ -190,11 +191,37 @@ class Classifier:
             matched_pattern=primary_pattern_str,
             evidence_snippet=evidence,
             action=primary_rule.action,
-            label=primary_rule.label or primary_rule.subcategory,
+            label=primary_display_label,
             secondary_hint=secondary_hint,
             all_labels=all_labels,
             evidence_detail=evidence_detail,
         )
+
+    # Cap a templated label so filter dropdowns and chips stay readable.
+    _LABEL_MAX_DETAIL = 80
+
+    def _format_display_label(
+        self, rule: RuleDefinition, evidence_detail: Optional[str]
+    ) -> str:
+        """Apply rule.label_template when both template and evidence_detail
+        are present. Long details are truncated with an 8-char hash suffix so
+        two composites that share the first 80 chars still produce distinct
+        labels (otherwise filter/group equality would collapse them).
+        """
+        base = rule.label or rule.subcategory
+        if not rule.label_template or not evidence_detail:
+            return base
+        detail = evidence_detail.strip()
+        if not detail:
+            return base
+        if len(detail) > self._LABEL_MAX_DETAIL:
+            import hashlib
+            digest = hashlib.sha1(detail.encode("utf-8")).hexdigest()[:8]
+            detail = detail[: self._LABEL_MAX_DETAIL].rstrip() + "…<" + digest + ">"
+        try:
+            return rule.label_template.format(detail=detail)
+        except (KeyError, IndexError, ValueError):
+            return base
 
     def _extract_detail(self, rule: RuleDefinition, normalized: str) -> Optional[str]:
         """Run the rule's optional extract_pattern and return the first non-empty named capture.
@@ -217,6 +244,11 @@ class Classifier:
                 # Trim and cap — keeps tooltips readable for composite captures.
                 v = value.strip()
                 return v if len(v) <= 400 else (v[:397] + "...")
+        # extract_pattern matched but every named group was empty
+        _log.debug(
+            "extract_pattern matched for rule %r but no named group yielded a value",
+            rule.name,
+        )
         return None
 
     def _normalize_log(self, raw_text: str) -> str:
@@ -350,6 +382,14 @@ class Classifier:
                 except re.error as e:
                     raise ValueError(f"{source}: rule {idx} extract_pattern is invalid regex: {e}")
 
+            # Optional opt-in display-label template; must reference {detail}.
+            label_template = rule_dict.get("label_template")
+            if label_template is not None:
+                if not isinstance(label_template, str):
+                    raise ValueError(f"{source}: rule {idx} 'label_template' must be a string when set")
+                if "{detail}" not in label_template:
+                    raise ValueError(f"{source}: rule {idx} 'label_template' must include the {{detail}} placeholder")
+
             out.append(RuleDefinition(
                 name=rule_dict["name"],
                 priority=rule_dict["priority"],
@@ -361,6 +401,7 @@ class Classifier:
                 label=label,
                 scope=scope,
                 extract_pattern=extract_pattern,
+                label_template=label_template,
             ))
         return out
 
@@ -676,6 +717,26 @@ class AnalysisOrchestrator:
                     on_result(metadata_event)
 
                 except Exception as e:
+                    # Upstream Jenkins 401
+                    if (
+                        isinstance(e, JenkinsClientError)
+                        and getattr(e, "status_code", None) == 401
+                        and not getattr(self, "_auth_error_fired", False)
+                    ):
+                        self._auth_error_fired = True
+                        on_result(SSEEvent(
+                            event_type=SSEEventType.AUTH_ERROR,
+                            job_id="",
+                            operation_id=operation_id,
+                            payload={
+                                "kind": "upstream-jenkins",
+                                "error_message": (
+                                    "Jenkins rejected the stored credentials "
+                                    "(401) mid-fetch."
+                                ),
+                            },
+                        ))
+
                     error_record = JobRecord(
                         job_name=job.get("name", "Unknown"),
                         job_url=job.get("url", ""),

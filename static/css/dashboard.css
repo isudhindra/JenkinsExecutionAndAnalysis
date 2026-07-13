@@ -3619,6 +3619,8 @@ tbody tr[data-job-id].row-refreshing [data-action="refresh"] {
     background: var(--color-surface);
     /* min-height prevents collapse even if content is sparse */
     min-height: 0;
+    /* Contain layout/paint so window resize doesn't reflow every row outside the viewport. */
+    contain: layout paint;
 }
 
 /* Extra bottom padding so the floating progress overlay can't cover rows. */

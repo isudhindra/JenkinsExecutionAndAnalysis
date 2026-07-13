@@ -1,6 +1,11 @@
 // utils.js — Shared DOM helpers, formatters, and small utility functions used everywhere.
 'use strict';
 
+// Normalise a Jenkins job URL for use as an appState.jobs Map key.
+function _normJobKey(url) {
+    return (url == null ? '' : String(url)).replace(/\/+$/, '');
+}
+
 // Local API token. apiFetch() attaches X-RACE-Token to every /api/* call;
 // SSE callers use sseUrl() with ?token= because EventSource can't add headers.
 window.RACE_TOKEN = (function () {
@@ -98,11 +103,35 @@ function apiFetch(url, opts) {
     return p;
 }
 
-// SSE / EventSource URL helper — appends 
+// SSE / EventSource URL helper — appends
 function sseUrl(url) {
     if (!window.RACE_TOKEN) return url;
     const sep = url.indexOf('?') === -1 ? '?' : '&';
     return url + sep + 'token=' + encodeURIComponent(window.RACE_TOKEN);
+}
+
+// Shared error-noise list
+const CLV_ERROR_NOISE_PATTERNS = [
+    // Empty [ERROR] / [FATAL] / [SEVERE] marker — no diagnostic content
+    /^\s*\[\s*(?:ERROR|FATAL|SEVERE)\s*\]\s*:?\s*$/i,
+    // Maven epilogue (printed after the real failure)
+    /See dump files? \(if any exist\)/i,
+    /To see the full stack trace of the errors,?\s*re-?run Maven/i,
+    /Re-?run Maven using the -X switch/i,
+    /For more information about the errors? and possible solutions/i,
+    /->\s*\[Help \d+\]/i,
+    /\[Help \d+\]\s*(?:https?:\/\/|$)/i,
+    // Jenkins shell-step exit marker — real cause is upstream
+    /script returned exit code \d+/i,
+];
+
+// True if the line is noise or empty — should not count as an error.
+function clvIsErrorNoise(text) {
+    if (!text || !String(text).trim()) return true;
+    for (let i = 0; i < CLV_ERROR_NOISE_PATTERNS.length; i++) {
+        if (CLV_ERROR_NOISE_PATTERNS[i].test(text)) return true;
+    }
+    return false;
 }
 
 // DOM shorthand helpers.

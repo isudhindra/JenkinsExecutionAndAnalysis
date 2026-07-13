@@ -184,9 +184,17 @@ function _categoryPredicate(category) {
         case 'aborted':
             return job => job.latest_status === 'ABORTED' || job.health_state === 'ABORTED';
         case 'needs_rerun':
-            return job => job.release_status === 'FAIL';
+            return job => {
+                const pt = (window.appState && appState.promotionTime) || null;
+                if (!pt || typeof deriveRegressionStatus !== 'function') return false;
+                return deriveRegressionStatus(job, pt) === 'failed';
+            };
         case 'pending':
-            return job => job.release_status === 'PENDING';
+            return job => {
+                const pt = (window.appState && appState.promotionTime) || null;
+                if (!pt || typeof deriveRegressionStatus !== 'function') return false;
+                return deriveRegressionStatus(job, pt) === 'not_executed';
+            };
         default:
             return () => false;
     }

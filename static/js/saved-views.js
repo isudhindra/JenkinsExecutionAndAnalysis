@@ -48,7 +48,9 @@ function _captureCurrentSnapshot() {
     const promoInput = document.getElementById('promotion-datetime');
     let promoSaved = null;
     if (promoInput && promoInput.value) {
-        promoSaved = promoInput.value;
+        // Normalise to YYYY-MM-DDTHH:MM so round-trip matches what the
+        // datetime-local input accepts (seconds drop silently otherwise).
+        promoSaved = String(promoInput.value).slice(0, 16);
     } else if (appState.promotionTime instanceof Date) {
         promoSaved = _formatLocalNaive(appState.promotionTime);
     }
@@ -71,11 +73,26 @@ function _captureCurrentSnapshot() {
 // Restore a snapshot into the live DOM/state. Doesn't auto-fetch —
 // the user clicks Fetch Jobs to confirm intent.
 function _applySnapshot(snap) {
+    // Validate against the current dropdown options so a legacy saved view
+    // with an unknown filter_status (e.g. backend codes from before the rename)
+    // doesn't silently leave the table empty after restore.
     const fs = document.getElementById('filter-status');
-    if (fs) fs.value = snap.filter_status || '';
+    if (fs) {
+        const raw = snap.filter_status || '';
+        const valid = !raw || Array.from(fs.options).some(o => o.value === raw);
+        fs.value = valid ? raw : '';
+        if (raw && !valid && typeof showToast === 'function') {
+            showToast(`Saved view's Status filter "${raw}" is no longer a valid option — cleared`, 'info');
+        }
+    }
 
+    // Legacy saved views stored raw backend codes (PASS/FAIL/PENDING/NA).
+    const _RELEASE_LEGACY = { PASS: 'passed', FAIL: 'failed', PENDING: 'not_executed', NA: 'not_executed' };
     const fr = document.getElementById('filter-release-status');
-    if (fr) fr.value = snap.filter_release || '';
+    if (fr) {
+        const raw = snap.filter_release || '';
+        fr.value = _RELEASE_LEGACY[raw] || raw;
+    }
 
     const search = document.getElementById('filter-search');
     if (search) search.value = snap.filter_search || '';
@@ -84,7 +101,9 @@ function _applySnapshot(snap) {
     if (typeof updateSelectedLabelBadge === 'function') updateSelectedLabelBadge();
 
     // Route through applyPromotionTime()
-    if (snap.promotion_time) {
+    const currentInstance = appState.selectedInstance ? appState.selectedInstance.id : null;
+    const sameInstance = !snap.instance_id || !currentInstance || snap.instance_id === currentInstance;
+    if (snap.promotion_time && sameInstance) {
         const promoInput = document.getElementById('promotion-datetime');
         if (promoInput) {
             const raw = String(snap.promotion_time);
@@ -100,7 +119,12 @@ function _applySnapshot(snap) {
             const d = new Date(snap.promotion_time);
             appState.promotionTime = isNaN(d.getTime()) ? null : d;
         }
-    } else {
+    } else if (snap.promotion_time && !sameInstance) {
+        // Cross-instance restore 
+        if (typeof showToast === 'function') {
+            showToast('Saved view\'s promotion time skipped — different Jenkins instance', 'info');
+        }
+    } else if (sameInstance) {
         // Snapshot had no promotion — clear any active one to match.
         const promoInput = document.getElementById('promotion-datetime');
         if (promoInput && promoInput.value) {
@@ -125,25 +149,28 @@ function _applySnapshot(snap) {
     if (snap.source_mode && typeof switchSourceMode === 'function') {
         switchSourceMode(snap.source_mode);
     }
-    if (snap.view_path) {
-        // Wait for onInstanceChange() to populate the view select first.
-        setTimeout(() => {
-            const vs = document.getElementById('cfg-view-select');
-            if (vs && Array.from(vs.options).some(o => o.value === snap.view_path)) {
-                vs.value = snap.view_path;
-                if (typeof onViewChange === 'function') onViewChange();
+    // Poll the dropdown for up to ~3s instead of guessing 200ms.
+    function _restoreSelectWhenReady(selectId, wantedValue, onPicked, label) {
+        if (!wantedValue) return;
+        const deadline = Date.now() + 3000;
+        const tick = () => {
+            const sel = document.getElementById(selectId);
+            if (sel && Array.from(sel.options).some(o => o.value === wantedValue)) {
+                sel.value = wantedValue;
+                if (typeof onPicked === 'function') onPicked();
+                return;
             }
-        }, 200);
-    }
-    if (snap.joblist_file) {
-        setTimeout(() => {
-            const js = document.getElementById('cfg-joblist-select');
-            if (js && Array.from(js.options).some(o => o.value === snap.joblist_file)) {
-                js.value = snap.joblist_file;
-                if (typeof onJobListChange === 'function') onJobListChange();
+            if (Date.now() < deadline) {
+                setTimeout(tick, 80);
+            } else if (typeof showToast === 'function') {
+                showToast(`Saved view's ${label} "${wantedValue}" couldn't be restored — source dropdown didn't load in time`, 'warning');
             }
-        }, 200);
+        };
+        setTimeout(tick, 50);
     }
+
+    _restoreSelectWhenReady('cfg-view-select',    snap.view_path,    typeof onViewChange    === 'function' ? onViewChange    : null, 'Jenkins view');
+    _restoreSelectWhenReady('cfg-joblist-select', snap.joblist_file, typeof onJobListChange === 'function' ? onJobListChange : null, 'job list');
 
     // Re-run filters against whatever's already in the table.
     if (typeof applyFilters === 'function') applyFilters();
@@ -290,6 +317,11 @@ function applySavedView(name) {
     const entry = views.find(v => v.name === name);
     if (!entry) return;
     _applySnapshot(entry.snapshot);
+    // Bump applied view to head — turns the 25-slot cap into LRU eviction so
+    // a heavily-used old view isn't dropped when the user saves throwaways.
+    const rest = views.filter(v => v.name !== name);
+    rest.unshift(entry);
+    _writeSavedViews(rest);
     if (typeof showToast === 'function') {
         showToast(`Loaded view "${name}" — click Fetch Jobs to refresh.`, 'info');
     }

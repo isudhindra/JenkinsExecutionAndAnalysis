@@ -44,6 +44,7 @@ class SSEEventType(str, Enum):
     JOB_ERROR = "JOB_ERROR"
     PROGRESS_UPDATE = "PROGRESS_UPDATE"
     FETCH_COMPLETE = "FETCH_COMPLETE"
+    AUTH_ERROR = "AUTH_ERROR"
 
 
 class StageCompletion(str, Enum):
@@ -250,7 +251,11 @@ class JobRecord:
                 if b is not None:
                     pool.setdefault(b.build_number, b)
 
-        post_promo = [b for b in pool.values() if b.timestamp > promotion_time]
+        # Normalise each build timestamp too
+        def _naive(ts):
+            return ts.astimezone().replace(tzinfo=None) if ts.tzinfo is not None else ts
+
+        post_promo = [b for b in pool.values() if _naive(b.timestamp) > promotion_time]
         if not post_promo:
             return ReleaseStatus.PENDING
         if any(b.status == BuildStatus.SUCCESS for b in post_promo):
@@ -264,10 +269,13 @@ class JobRecord:
         """Serialise to a JSON-ready dict, including a derived release_status when promotion_time is given.
         current_status always reflects the latest build.
         """
+        # is_running is derived so /api/refresh-single matches /api/poll-status 
+        _cs = self.current_status.value if isinstance(self.current_status, BuildStatus) else self.current_status
         result = {
             "job_name": self.job_name,
             "job_url": self.job_url,
-            "current_status": self.current_status.value if isinstance(self.current_status, BuildStatus) else self.current_status,
+            "current_status": _cs,
+            "is_running": _cs == "IN_PROGRESS",
             "release_status": self.compute_release_status(promotion_time).value,
             "health_state": self.health_state.value if isinstance(self.health_state, HealthState) else self.health_state,
             "last_refreshed_at": self.last_refreshed_at.isoformat(),
@@ -365,6 +373,8 @@ class RuleDefinition:
     scope: str = "global"
     # Optional regex with named capture groups
     extract_pattern: Optional[str] = None
+    # Opt-in: per-result label = label_template.format(detail=evidence_detail).
+    label_template: Optional[str] = None
 
 
 @dataclass

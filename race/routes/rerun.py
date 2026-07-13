@@ -34,7 +34,19 @@ def rerun_builds():
 
     # Drop any URL that doesn't live under the picked Jenkins.
     base = data.get("jenkins_url") or ""
+    requested_count = len(job_urls)
     job_urls = [u for u in job_urls if url_belongs_to(u, base)]
+    dropped_count = requested_count - len(job_urls)
+
+    if not job_urls:
+        return jsonify({
+            "error": (
+                f"None of the {requested_count} supplied job URL(s) belong to "
+                f"the selected Jenkins instance"
+            ),
+            "results": [],
+            "dropped": dropped_count,
+        }), 400
 
     client = make_client(data, timeout=current_app.config["default_timeout"])
 
@@ -54,4 +66,4 @@ def rerun_builds():
                 "error": safe_err(e),
             })
 
-    return jsonify({"results": results}), 200
+    return jsonify({"results": results, "dropped": dropped_count}), 200

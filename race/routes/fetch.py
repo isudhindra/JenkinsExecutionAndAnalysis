@@ -41,7 +41,7 @@ def fetch_stream():
     data = resolve_credentials(body)
     operation_id = str(uuid.uuid4())
     state.active_operation_id = operation_id
-    state.job_store.clear()
+    state.job_store_clear()
 
     source_mode = data.get("source_mode")
     jenkins_url = data.get("jenkins_url")

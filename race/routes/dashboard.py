@@ -48,6 +48,9 @@ def dashboard() -> str:
 def get_config():
     """Return runtime config and analysis taxonomy as JSON for frontend boot."""
     classifier = current_app.classifier  # type: ignore[attr-defined]
+    # Surface the in-memory-token fingerprint when the on-disk token
+    token_fp = current_app.config.get("LOCAL_API_TOKEN_FINGERPRINT") or ""
+    token_in_memory = bool(current_app.config.get("LOCAL_API_TOKEN_IN_MEMORY"))
     return jsonify({
         # Fallback uses the canonical default so the browser never disagrees with the backend.
         "thread_pool_size": current_app.config.get("thread_pool_size", DEFAULT_WORKERS),
@@ -55,6 +58,8 @@ def get_config():
         # Same value as the template injection
         "auto_refresh_interval_ms": int(current_app.config.get("auto_refresh_interval_ms", 30000)),
         "contexts": current_app.config.get("contexts", {}),
+        "token_in_memory": token_in_memory,
+        "token_fingerprint": token_fp,
         "analysis_taxonomy": {
             "domain_colors": classifier.domain_colors,
             "fallback_labels": classifier.fallback_labels,

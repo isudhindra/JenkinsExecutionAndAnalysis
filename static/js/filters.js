@@ -474,11 +474,12 @@ function sortTable(key, type) {
     resize();
     draw();
 
-    // Debounce resize so we don't redraw on every pixel change.
+    // Pause animation during window resize so 150+ table rows can reflow
     let resizeTimer;
     window.addEventListener('resize', function() {
+        if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
         clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(resize, 200);
+        resizeTimer = setTimeout(function() { resize(); draw(); }, 200);
     });
 
     // Pause the animation while the tab is hidden (battery / CPU).
@@ -862,12 +863,14 @@ function updateLaActiveItem(items) {
 // workflow order (PASS → PENDING → FAIL → NA), with unknown future values
 // appended in insertion order (forward-compat).
 
-const _RELEASE_STATUS_ORDER = ['PASS', 'PENDING', 'FAIL', 'NA'];
+// Mirror the Release Status column's derived categories (deriveRegressionStatus).
+// Dropdown options match exactly what the user sees in the column.
+const _RELEASE_STATUS_ORDER = ['passed', 'failed', 'in_progress', 'not_executed'];
 const _RELEASE_STATUS_LABEL = {
-    PASS: 'Pass',
-    PENDING: 'Pending',
-    FAIL: 'Fail',
-    NA: 'Not Applicable',
+    passed:       'Passed',
+    failed:       'Failed',
+    in_progress:  'In Progress',
+    not_executed: 'Needs Running',
 };
 let _lastReleaseStatusFingerprint = '';
 
@@ -875,10 +878,13 @@ function populateReleaseStatusFilter() {
     const sel = document.getElementById('filter-release-status');
     if (!sel) return;
 
+    // Derive each job's category the same way the column does — single source of truth.
+    const pt = (window.appState && appState.promotionTime) || null;
     const present = new Set();
-    if (window.appState && appState.jobs) {
+    if (pt && window.appState && appState.jobs && typeof deriveRegressionStatus === 'function') {
         appState.jobs.forEach(job => {
-            const rs = job && job.release_status;
+            if (!job) return;
+            const rs = deriveRegressionStatus(job, pt);
             if (rs) present.add(rs);
         });
     }
@@ -910,12 +916,19 @@ function populateReleaseStatusFilter() {
         sel.appendChild(opt);
     }
 
-    // Restore prior pick if still valid; otherwise reset to "All" and clear filter state.
+    // Restore prior pick if still valid; otherwise reset to "All".
     if (prevValue && present.has(prevValue)) {
         sel.value = prevValue;
     } else {
         sel.value = '';
         if (window.appState && appState.filters) appState.filters.releaseStatus = null;
+        if (prevValue) {
+            const label = _RELEASE_STATUS_LABEL[prevValue] || prevValue;
+            if (typeof showToast === 'function') {
+                showToast(`Release Status filter "${label}" cleared — no matching jobs remain`, 'info');
+            }
+            if (typeof applyFilters === 'function') applyFilters();
+        }
     }
 }
 
@@ -1039,7 +1052,13 @@ function _applyFiltersImpl() {
 function matchesFilters(job) {
     if (appState.filters.status && job.latest_status !== appState.filters.status) return false;
 
-    if (appState.filters.releaseStatus && job.release_status !== appState.filters.releaseStatus) return false;
+    // Compare against the derived category, same as the column. 
+    if (appState.filters.releaseStatus) {
+        const pt = appState.promotionTime;
+        const derived = (pt && typeof deriveRegressionStatus === 'function')
+            ? deriveRegressionStatus(job, pt) : null;
+        if (derived !== appState.filters.releaseStatus) return false;
+    }
 
     if (appState.filters.searchText) {
         // Defensive `|| ''` — a single missing name/url would otherwise throw
@@ -1048,8 +1067,10 @@ function matchesFilters(job) {
         const url  = (job.url  || '').toString();
         const re = appState.filters._searchRe;
         if (re) {
-            // Wildcard regex path — test raw name/url so the ^...$ anchors work.
-            if (!re.test(name) && !re.test(url)) return false;
+            // Wildcard regex path — anchored ^...$ matches the job NAME only
+            // (URLs are full Jenkins paths that anchored patterns almost never
+            // hit). Plain substring search still tests both name and URL.
+            if (!re.test(name)) return false;
         } else {
             // Plain case-insensitive substring fallback.
             const searchText = appState.filters.searchText;

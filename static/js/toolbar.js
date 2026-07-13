@@ -69,9 +69,20 @@ function updateToolbarActions() {
         const el = document.getElementById(id);
         if (el) el.style.display = condition ? '' : 'none';
     };
-    showHide('ops-refresh-failed', hasFailed);
-    showHide('ops-refresh-unstable', hasUnstable);
-    showHide('ops-refresh-aborted', hasAborted);
+    // "Refresh Failed" / "Refresh Unstable" / "Refresh Aborted" stay visible
+    // when zero candidates remain — disabled with a tooltip so the sign-off
+    // ritual ("I clicked it and got 0") still has an affordance.
+    const setRefreshState = (id, ok, label) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.style.display = '';
+        el.disabled = !ok;
+        if (!ok) el.title = `No ${label} jobs in current scope`;
+        else el.title = '';
+    };
+    setRefreshState('ops-refresh-failed', hasFailed, 'failed');
+    setRefreshState('ops-refresh-unstable', hasUnstable, 'unstable');
+    setRefreshState('ops-refresh-aborted', hasAborted, 'aborted');
     showHide('ops-refresh-selected', hasSelected);
     showHide('ops-refresh-sel-divider', hasSelected);
 
@@ -232,10 +243,13 @@ function setToolbarViewState(mode) {
 }
 
 // Build one entry per failed/unstable job, with deduped error summary
-// and a search blob for the filter input.
 function collectFailureEntries() {
     var entries = [];
+    var scope = (typeof getActionScope === 'function') ? getActionScope() : null;
+    var scopedSet = (scope && scope.label !== 'all') ? new Set(scope.jobIds) : null;
+
     appState.jobs.forEach(function(job, jobId) {
+        if (scopedSet && !scopedSet.has(jobId)) return;
         var st = job.latest_status;
         if (st !== 'FAILURE' && st !== 'UNSTABLE') return;
 
@@ -246,6 +260,16 @@ function collectFailureEntries() {
         var jobUrl = job.url || job.job_url || jobId;
 
         var errorLogs = fe.error_logs || [];
+
+        if (errorLogs.length > 0 && typeof clvIsErrorNoise === 'function') {
+            errorLogs = errorLogs.filter(function(errEntry) {
+                var msg = errEntry.message || '';
+                var level = errEntry.level || 'ERROR';
+                // Match against both the raw message
+                return !(clvIsErrorNoise(msg) || clvIsErrorNoise(level + ': ' + msg));
+            });
+        }
+
         var errorItems = [];     // expanded detail panel rows
         var uniqueErrors = [];   // deduped short messages for the collapsed row
         var rawTextParts = [];   // every error string concatenated for search
@@ -310,23 +334,78 @@ function collectFailureEntries() {
     return entries;
 }
 
-// Render the failure consolidation table — one row per failed/unstable job,
-// expandable to show detailed error breakdown.
-function renderFailureView() {
-    var entries = collectFailureEntries();
+// Per-entry error filter.
+function _fvApplyErrorFilter(entry, term) {
+    if (!term) return entry;
+    var t = term.toLowerCase();
+    var jobNameMatch = (entry.jobName || '').toLowerCase().indexOf(t) !== -1;
+    var matched = entry.errorItems.filter(function(it) {
+        return (it.detail || '').toLowerCase().indexOf(t) !== -1
+            || (it.message || '').toLowerCase().indexOf(t) !== -1;
+    });
+    if (matched.length === 0) return jobNameMatch ? entry : null;
+    // Rebuild dedup summary from the filtered items only.
+    var seen = {};
+    var unique = [];
+    matched.forEach(function(it) {
+        var key = (it.message || '').substring(0, 80).toLowerCase();
+        if (!seen[key]) { seen[key] = { msg: it.message, count: 1 }; unique.push(seen[key]); }
+        else seen[key].count++;
+    });
+    var errorSummary = unique.map(function(u) {
+        return u.count > 1 ? u.msg + ' (\u00D7' + u.count + ')' : u.msg;
+    }).join('\n');
+    return Object.assign({}, entry, {
+        errorItems: matched,
+        errorCount: matched.length,
+        errorSummary: errorSummary,
+        _fvFiltered: true,
+    });
+}
+
+// Render the failure consolidation table — one row per failed/unstable job
+function renderFailureView(searchTerm) {
+    var rawEntries = collectFailureEntries();
+    var term = (searchTerm || '').toLowerCase().trim();
+    var entries = term
+        ? rawEntries.map(function(e) { return _fvApplyErrorFilter(e, term); }).filter(Boolean)
+        : rawEntries;
+
     var tbody = document.getElementById('fv-tbody');
     if (!tbody) return;
 
     if (entries.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" class="fv-empty">No failures found in the current dataset.</td></tr>';
-        var sub = document.getElementById('fv-subtitle');
-        if (sub) sub.textContent = '0 failed jobs';
+        tbody.innerHTML = '<tr><td colspan="4" class="fv-empty">'
+            + (term ? 'No failures match this search.' : 'No failures found in the current dataset.')
+            + '</td></tr>';
+        var subEmpty = document.getElementById('fv-subtitle');
+        if (subEmpty) subEmpty.textContent = term
+            ? 'Showing 0 of ' + rawEntries.length + ' jobs (filtered)'
+            : '0 failed jobs';
         return;
     }
 
     var totalErrors = entries.reduce(function(sum, e) { return sum + e.errorCount; }, 0);
+    // Detect whether collectFailureEntries was scoped to a filter/selection.
+    // For the unscoped/unsearched line we'd already say "N failed jobs" \u2014 saying
+    // "scoped to N filtered jobs" too is tautological. Use a clearer phrasing.
+    var mainScope = (typeof getActionScope === 'function') ? getActionScope() : null;
+    var scoped = (mainScope && mainScope.label !== 'all');
     var sub = document.getElementById('fv-subtitle');
-    if (sub) sub.textContent = entries.length + ' failed ' + (entries.length === 1 ? 'job' : 'jobs') + ' \u00B7 ' + totalErrors + ' ' + (totalErrors === 1 ? 'error' : 'errors');
+    if (sub) {
+        if (term) {
+            sub.textContent = 'Showing ' + entries.length + ' of ' + rawEntries.length + ' jobs (filtered) \u00B7 '
+                + totalErrors + ' matching ' + (totalErrors === 1 ? 'error' : 'errors')
+                + (scoped ? ' \u00B7 from ' + mainScope.label + ' scope' : '');
+        } else if (scoped) {
+            sub.textContent = entries.length + ' failed ' + (entries.length === 1 ? 'job' : 'jobs')
+                + ' in current ' + mainScope.label + ' scope (of ' + mainScope.totalCount + ' total) \u00B7 '
+                + totalErrors + ' ' + (totalErrors === 1 ? 'error' : 'errors');
+        } else {
+            sub.textContent = entries.length + ' failed ' + (entries.length === 1 ? 'job' : 'jobs')
+                + ' \u00B7 ' + totalErrors + ' ' + (totalErrors === 1 ? 'error' : 'errors');
+        }
+    }
 
     // Cache entries so the expand handler can look them up by jobId.
     window._fvEntries = {};
@@ -428,36 +507,9 @@ function toggleFailureView() {
     }
 }
 
-// Filter failure-view rows against the pre-built searchBlob (job name + every error string).
+// Re-render the failure view filtered by searchTerm.
 function filterFailureRows(searchTerm) {
-    var tbody = document.getElementById('fv-tbody');
-    if (!tbody) return;
-    var term = searchTerm.toLowerCase().trim();
-    var rows = tbody.querySelectorAll('tr[data-fv-job]');
-    var visible = 0;
-    rows.forEach(function(row) {
-        var idx = row.getAttribute('data-fv-idx');
-        var detailRow = idx != null ? document.getElementById('fv-detail-' + idx) : null;
-        if (!term) {
-            row.style.display = '';
-            if (detailRow) detailRow.style.display = '';
-            visible++;
-            return;
-        }
-        var blob = (row.getAttribute('data-fv-search') || '').toLowerCase();
-        var match = blob.indexOf(term) !== -1;
-        row.style.display = match ? '' : 'none';
-        if (detailRow) detailRow.style.display = match ? '' : 'none';
-        if (match) visible++;
-    });
-    var sub = document.getElementById('fv-subtitle');
-    if (sub) {
-        if (term) {
-            sub.textContent = 'Showing ' + visible + ' of ' + rows.length + ' jobs (filtered)';
-        } else {
-            sub.textContent = rows.length + ' job' + (rows.length !== 1 ? 's' : '') + ' with failures or instabilities';
-        }
-    }
+    renderFailureView(searchTerm || '');
 }
 
 // Debounce the search input so we don't filter on every keystroke.
@@ -488,7 +540,11 @@ function scheduleRerunBadgeCleanup(jobIds, delay) {
 
 // Trigger Jenkins reruns and reflect the result on each row via the rerun badge.
 async function triggerRerun(jobIds) {
-    if (appState.activeOperationId) {
+    // activeOperationId only flips after the SSE handshake — there's a 0-500ms
+    // window after Fetch click where it's null but a fetch is in flight.
+    // Also gate on _fetchAbortController so the rerun network call doesn't
+    // race with a resetDashboardState() from a still-starting fetch.
+    if (appState.activeOperationId || appState._fetchAbortController) {
         showToast('Cannot rerun while a fetch/refresh is in progress', 'warning');
         return;
     }
@@ -532,13 +588,58 @@ async function triggerRerun(jobIds) {
 
         const result = await response.json();
         if (response.ok) {
-            jobIds.forEach(jobId => {
-                appState.rerunStates.set(jobId, 'Triggered');
+            // Backend returns {results: [{job_url, triggered, error}]} —
+            // honour per-job outcomes instead of marking every row Triggered.
+            const results = Array.isArray(result.results) ? result.results : [];
+            const triggeredIds = [];
+            const failedIds = [];
+            // Map response by URL so we can pair with the row's jobId.
+            const byUrl = new Map();
+            results.forEach(r => { if (r && r.job_url) byUrl.set(r.job_url, r); });
+
+            jobIds.forEach((jobId, i) => {
+                const url = jobUrls[i];
+                const r = byUrl.get(url) || byUrl.get(jobId);
+                let state = 'TriggerFailed';
+                let errMsg = '';
+                if (!r) {
+                    // URL silently dropped by backend (e.g. didn't belong to instance).
+                    state = 'TriggerFailed';
+                    errMsg = 'Server did not report a result for this job';
+                } else if (r.triggered) {
+                    state = 'Triggered';
+                    triggeredIds.push(jobId);
+                } else {
+                    failedIds.push(jobId);
+                    errMsg = String(r.error || '').toLowerCase();
+                    if (errMsg.includes('permission')) state = 'PermissionDenied';
+                    else if (errMsg.includes('disabled')) state = 'JobDisabled';
+                    else state = 'TriggerFailed';
+                }
+                appState.rerunStates.set(jobId, state);
                 const row = document.querySelector(`tr[data-job-id="${escapeHtml(jobId)}"]`);
-                if (row) updateRerunBadge(row, 'Triggered');
+                if (row) {
+                    updateRerunBadge(row, state);
+                    // Surface the per-job error message via the badge tooltip.
+                    if (state !== 'Triggered' && r && r.error) {
+                        const badge = row.querySelector('.badge-rerun');
+                        if (badge) badge.title = String(r.error);
+                    }
+                }
             });
+
             scheduleRerunBadgeCleanup(jobIds, 10000);
-            showToast(`${jobIds.length} job(s) rerun triggered`, 'success');
+
+            const total = jobIds.length;
+            const ok = triggeredIds.length;
+            const bad = failedIds.length + (total - ok - failedIds.length);  // includes silent drops
+            if (ok === total) {
+                showToast(`${ok} job(s) rerun triggered`, 'success');
+            } else if (ok > 0) {
+                showToast(`${ok} of ${total} rerun triggered — ${bad} failed (hover the badges for reasons)`, 'warning');
+            } else {
+                showToast(`All ${total} rerun(s) failed — hover the badges for reasons`, 'error');
+            }
         } else {
             throw new Error(result.message || 'Rerun failed');
         }

@@ -70,6 +70,13 @@ async function _pollOnce() {
     try {
         const creds = appState.authCredentials;
         const jobUrls = Array.from(appState.jobs.keys());
+
+        // Prune keys for jobs no longer in appState — otherwise a fetch reset
+        // leaves stale signatures forever, growing the map indefinitely.
+        const currentUrlSet = new Set(jobUrls);
+        for (const key of Array.from(window._autoRefresh.lastStatuses.keys())) {
+            if (!currentUrlSet.has(key)) window._autoRefresh.lastStatuses.delete(key);
+        }
         const viewUrl = appState.currentViewUrl || '';
         const sourceMode = appState.sourceMode || '';
         const tickStart = performance.now();
@@ -107,16 +114,37 @@ async function _pollOnce() {
 
         // Diff against last seen signatures. The first poll just seeds the
         // cache so we don't fire a false-positive "everything changed" toast.
+        // Track separately the jobs whose build_number actually incremented —
+        // only those should clear a TRIGGERED rerun badge.
         const changed = [];
+        const buildIncrementedSet = new Set();
         const isFirstPoll = window._autoRefresh.lastStatuses.size === 0;
+        let sawError = false;
 
         for (const s of statuses) {
+            // Per-job ERROR from the poll = transient Jenkins blip. Don't
+            // cache the signature so the next tick retries; flag the dataset
+            // as stale so the user sees the row may be out of date.
+            if (s.status === 'ERROR') {
+                sawError = true;
+                continue;
+            }
             const sig = _sig(s.build_number, s.status, !!s.is_running);
             const previous = window._autoRefresh.lastStatuses.get(s.job_url);
             window._autoRefresh.lastStatuses.set(s.job_url, sig);
             if (!isFirstPoll && previous !== undefined && previous !== sig) {
                 changed.push(s.job_url);
+                // build_number lives at the head of the signature ("N:STATUS:R").
+                const prevBN = previous ? parseInt(previous.split(':')[0], 10) : NaN;
+                const currBN = (s.build_number != null) ? Number(s.build_number) : NaN;
+                if (Number.isFinite(prevBN) && Number.isFinite(currBN) && currBN > prevBN) {
+                    buildIncrementedSet.add(s.job_url);
+                }
             }
+        }
+
+        if (sawError && typeof markDataStale === 'function') {
+            markDataStale('one or more rows returned ERROR from Jenkins poll');
         }
 
         // One summary line per tick
@@ -140,11 +168,44 @@ async function _pollOnce() {
         // For each changed job
         await _runWithConcurrencyLimit(orderedChanged, _enrichChangedJob, 3);
 
-        // Fresh status implicitly
-        orderedChanged.forEach(_clearRerunBadge);
+        // Clear the TRIGGERED rerun badge ONLY for jobs whose build_number
+        // actually incremented — a status flicker on the same build (e.g. a
+        // still-pending rerun) must keep the badge so the user sees their
+        // action is in flight.
+        orderedChanged.forEach(jobUrl => {
+            if (buildIncrementedSet.has(jobUrl)) _clearRerunBadge(jobUrl);
+        });
 
         orderedChanged.forEach(_flashRow);
         _showAutoRefreshToast(orderedChanged.length);
+
+        // After enrichment, re-derive release-status badges and refresh the
+        // Validation panel counts so the per-row chip + the panel rerun
+        // button stay in sync with the latest job state.
+        if (appState.promotionTime) {
+            if (typeof recalculateAllRegressionCells === 'function') {
+                recalculateAllRegressionCells(appState.promotionTime);
+            }
+            if (typeof updatePromotionPanel === 'function') {
+                updatePromotionPanel(appState.promotionTime);
+            }
+        }
+
+        // If the failure view is open, re-render it so the consolidated
+        // list reflects the latest statuses + error_logs. Preserve the
+        // user's in-progress search input value + caret across the rebuild.
+        if (typeof _failureViewActive !== 'undefined' && _failureViewActive
+            && typeof renderFailureView === 'function') {
+            const fvSearchEl = document.getElementById('fv-search');
+            const term = fvSearchEl ? fvSearchEl.value : '';
+            const caret = fvSearchEl ? fvSearchEl.selectionStart : null;
+            renderFailureView(term);
+            // renderFailureView doesn't touch the input itself, but if it ever
+            // does in future, restore caret defensively.
+            if (fvSearchEl && caret != null && document.activeElement === fvSearchEl) {
+                try { fvSearchEl.setSelectionRange(caret, caret); } catch (_) {}
+            }
+        }
 
     } catch (err) {
         diagLog && diagLog('warning', 'AutoRefresh', 'Poll error: ' + (err && err.message));
@@ -189,23 +250,38 @@ async function _enrichChangedJob(jobUrl) {
                 promotion_time: (typeof getPromotionTimeISO === 'function') ? getPromotionTimeISO() : '',
             }),
         });
-        if (!resp.ok) return;
+        if (!resp.ok) {
+            if (resp.status === 429 && typeof diagLog === 'function') {
+                diagLog('warning', 'AutoRefresh',
+                    'refresh-single throttled (429) — skipped this tick; next poll will retry',
+                    { url: jobUrl });
+            }
+            return;
+        }
         const data = await resp.json();
         // Merge into the existing record — never replace. The backend returns
         // job_name/job_url but the UI reads name/url, and a wholesale replace
         // strips those fields and breaks search.
         if (data && data.job_url) {
-            const existing = appState.jobs.get(data.job_url) || {};
+            const normKey = (typeof _normJobKey === 'function') ? _normJobKey(data.job_url) : data.job_url;
+            const existing = appState.jobs.get(normKey) || {};
+            // Derive is_running from current_status if the wire payload omits
+            // it — without this fallback, a stale is_running=true survives and
+            // keeps the rerun button disabled on a now-failed job.
+            const nextRunning = (data.is_running !== undefined)
+                ? !!data.is_running
+                : (data.current_status === 'IN_PROGRESS');
             const merged = Object.assign({}, existing, data, {
                 latest_status: data.current_status,
+                is_running:    nextRunning,
                 // Preserve canonical name/url that the rest of the frontend reads.
                 name: data.job_name || existing.name,
                 url:  data.job_url  || existing.url,
                 job_id: existing.job_id || data.job_url,
             });
-            appState.jobs.set(data.job_url, merged);
+            appState.jobs.set(normKey, merged);
             if (typeof updateJobRow === 'function') {
-                updateJobRow(data.job_url, merged);
+                updateJobRow(normKey, merged);
             }
         }
     } catch (_) {

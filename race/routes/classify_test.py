@@ -62,11 +62,22 @@ def classify_test():
         }), 400
 
     live_rules_dir = _live_rules_dir()
+    # Snapshot the live rule files into memory FIRST (single tight pass).
+    rule_snapshot: list[tuple[str, bytes]] = []
+    if live_rules_dir and os.path.isdir(live_rules_dir):
+        for fname in sorted(os.listdir(live_rules_dir)):
+            if not fname.endswith(".yaml"):
+                continue
+            try:
+                with open(os.path.join(live_rules_dir, fname), "rb") as src:
+                    rule_snapshot.append((fname, src.read()))
+            except OSError:
+                continue
+
     with tempfile.TemporaryDirectory(prefix="race-sandbox-") as tmp:
-        if live_rules_dir and os.path.isdir(live_rules_dir):
-            for fname in os.listdir(live_rules_dir):
-                if fname.endswith(".yaml"):
-                    shutil.copy(os.path.join(live_rules_dir, fname), tmp)
+        for fname, content in rule_snapshot:
+            with open(os.path.join(tmp, fname), "wb") as dst:
+                dst.write(content)
         # zz- prefix makes the candidate sort last — its priorities still
         # decide ordering inside Classifier (priority field, not filename).
         with open(os.path.join(tmp, "zz-sandbox-candidate.yaml"), "w") as f:

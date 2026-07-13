@@ -184,6 +184,16 @@ async function initFetchStream(url, body) {
                     handleProgressUpdate(data);
                 } else if (data.event_type === 'job_error') {
                     handleJobError(data);
+                } else if (data.event_type === 'auth_error') {
+                    // Upstream Jenkins 401 mid-stream
+                    if (typeof _showJenkinsAuthBanner === 'function') {
+                        _showJenkinsAuthBanner();
+                    }
+                    if (typeof diagLog === 'function') {
+                        diagLog('warning', 'Jenkins auth',
+                            'Upstream Jenkins 401 mid-fetch — stored credentials likely expired',
+                            { kind: 'upstream-jenkins', event: 'sse-auth_error' });
+                    }
                 } else if (data.event_type === 'fetch_complete') {
                     handleFetchComplete(data);
                 } else {
@@ -537,10 +547,22 @@ function resetRowBatch() {
 
 // Handle a job_metadata event: upsert the job record and render or refresh its row.
 function handleJobMetadata(data) {
-    const jobId = data.job_url;
+    const jobId = (typeof _normJobKey === 'function') ? _normJobKey(data.job_url) : data.job_url;
     const isRunning = data.is_running === true || data.current_status === 'IN_PROGRESS';
     const analysisRef = data.analysis_reference || null;
-    const job = {
+    const existing = appState.jobs.get(jobId) || {};
+
+    // Keep existing enrichment when the new payload doesn't carry it.
+    const keepClassification = (data.classification !== undefined && data.classification !== null)
+        ? data.classification
+        : (existing.classification || null);
+    const keepFailureEvidence = (data.failure_evidence !== undefined && data.failure_evidence !== null)
+        ? data.failure_evidence
+        : (existing.failure_evidence || null);
+    const newRecentBuilds = Array.isArray(data.recent_builds) ? data.recent_builds : [];
+    const keepRecentBuilds = newRecentBuilds.length > 0 ? newRecentBuilds : (existing.recent_builds || []);
+
+    const job = Object.assign({}, existing, {
         job_id: jobId,
         name: data.job_name,
         url: data.job_url,
@@ -548,20 +570,27 @@ function handleJobMetadata(data) {
         is_running: isRunning,
         analysis_reference: analysisRef,
         previous_status: data.previous_status || (data.three_run_context && data.three_run_context.previous ? data.three_run_context.previous.status : null) || data.current_status,
-        last_passed: (data.three_run_context && data.three_run_context.last_passed) || data.last_passed || null,
-        test_metrics: data.test_metrics || {},
+        last_passed: (data.three_run_context && data.three_run_context.last_passed) || data.last_passed || existing.last_passed || null,
+        test_metrics: data.test_metrics || existing.test_metrics || {},
         last_refreshed_at: new Date(data.last_refreshed_at || Date.now()),
-        last_execution_time: data.last_execution_time || (data.three_run_context && data.three_run_context.latest ? data.three_run_context.latest.timestamp : null) || null,
-        data_completeness: data.data_completeness || 'UNKNOWN',
-        three_run_context: data.three_run_context || {},
-        recent_builds: data.recent_builds || [],
-        classification: data.classification || null,
-        failure_evidence: data.failure_evidence || null,
+        last_execution_time: data.last_execution_time || (data.three_run_context && data.three_run_context.latest ? data.three_run_context.latest.timestamp : null) || existing.last_execution_time || null,
+        data_completeness: data.data_completeness || existing.data_completeness || 'UNKNOWN',
+        three_run_context: data.three_run_context || existing.three_run_context || {},
+        recent_builds: keepRecentBuilds,
+        classification: keepClassification,
+        failure_evidence: keepFailureEvidence,
         // Backend computes release_status server-side when promotion_time is supplied.
         // Stored on the job so the Release-Status filter and selection helpers can
         // read it directly without recomputing client-side.
-        release_status: data.release_status || null
-    };
+        release_status: data.release_status || existing.release_status || null,
+    });
+
+    // Mid-stream promotion change — rows arriving after a promo-time edit carry
+    // the OLD baseline from the operation. Recompute against the LIVE promotion
+    // so the table doesn't mix two baselines silently. Wave 5 H2.
+    if (appState.promotionTime && typeof _recomputeReleaseStatusForJob === 'function') {
+        job.release_status = _recomputeReleaseStatusForJob(job, appState.promotionTime);
+    }
 
     appState.lastRefreshTimes.set(jobId, new Date());
     const existingRow = getJobRowEl(jobId);
@@ -594,13 +623,12 @@ function mergeEnrichmentFields(job, data) {
     if (data.failure_evidence) job.failure_evidence = data.failure_evidence;
     if (data.recent_builds && data.recent_builds.length) job.recent_builds = data.recent_builds;
     // Backend recomputes release_status whenever promotion_time is set;
-    // accept the latest value so the filter dropdown stays accurate.
-    if (data.release_status) job.release_status = data.release_status;
+    if (data.release_status !== undefined) job.release_status = data.release_status;
 }
 
 // Handle a job_enriched event: layer classification + metrics onto an existing row.
 function handleJobEnriched(data) {
-    const jobId = data.job_url;
+    const jobId = (typeof _normJobKey === 'function') ? _normJobKey(data.job_url) : data.job_url;
     const job = appState.jobs.get(jobId);
     if (!job) return;
 
@@ -624,6 +652,12 @@ function handleJobEnriched(data) {
     }
 
     mergeEnrichmentFields(job, { ...data, classification: null });
+
+    // Stage-2 enrichment may include recent_builds — rebaseline release_status
+    // against the LIVE promotion so a mid-stream promo change is honoured. Wave 5 H2.
+    if (appState.promotionTime && typeof _recomputeReleaseStatusForJob === 'function') {
+        job.release_status = _recomputeReleaseStatusForJob(job, appState.promotionTime);
+    }
 
     const row = getJobRowEl(jobId);
     if (row) {

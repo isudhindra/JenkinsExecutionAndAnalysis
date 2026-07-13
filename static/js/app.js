@@ -140,6 +140,8 @@ function checkStaleRow(row, jobId) {
 const _refreshingJobs = new Set();
 
 async function refreshSingleJob(jobId) {
+    // Normalise the incoming key so a DOM-derived jobId with a trailing slash
+    if (typeof _normJobKey === 'function') jobId = _normJobKey(jobId);
     if (_refreshingJobs.has(jobId)) {
         showToast('Refresh already in progress for this job', 'info');
         return;
@@ -192,7 +194,14 @@ async function refreshSingleJob(jobId) {
         const job = appState.jobs.get(jobId) || {};
         if (data.current_status !== undefined) job.latest_status = data.current_status;
         if (data.health_state !== undefined) job.health_state = data.health_state;
-        if (data.is_running !== undefined) job.is_running = data.is_running;
+        // Derive is_running from the canonical latest_status post-merge.
+        if (data && data.error) {
+            job.is_running = false;
+        } else if (data.is_running !== undefined) {
+            job.is_running = !!data.is_running;
+        } else {
+            job.is_running = (job.latest_status === 'IN_PROGRESS');
+        }
         if (data.job_name !== undefined) job.name = data.job_name;
         if (data.last_execution_time !== undefined) job.last_execution_time = data.last_execution_time;
         if (data.last_build_number !== undefined) job.last_build_number = data.last_build_number;
@@ -222,6 +231,26 @@ async function refreshSingleJob(jobId) {
 
         updateSummaryBar();
         rebuildLogAnalysisLabelCache();
+
+        // manual refresh must keep the Failure View + Release
+        if (appState.promotionTime) {
+            if (typeof recalculateAllRegressionCells === 'function') {
+                recalculateAllRegressionCells(appState.promotionTime);
+            }
+            if (typeof updatePromotionPanel === 'function') {
+                updatePromotionPanel(appState.promotionTime);
+            }
+        }
+        if (typeof _failureViewActive !== 'undefined' && _failureViewActive
+            && typeof renderFailureView === 'function') {
+            const fvSearchEl = document.getElementById('fv-search');
+            const term = fvSearchEl ? fvSearchEl.value : '';
+            const caret = fvSearchEl ? fvSearchEl.selectionStart : null;
+            renderFailureView(term);
+            if (fvSearchEl && caret != null && document.activeElement === fvSearchEl) {
+                try { fvSearchEl.setSelectionRange(caret, caret); } catch (_) {}
+            }
+        }
 
         showToast(`Refreshed: ${job.name || jobId.split('/').pop()}`, 'success');
     } catch (err) {
@@ -311,6 +340,15 @@ function clearAllFilters() {
         if (typeof clearLogAnalysisFilter === 'function') clearLogAnalysisFilter();
     } catch (_) { /* keep going */ }
 
+    // Uncheck the Release Validation category checkboxes
+    try {
+        ['promo-cat-failed', 'promo-cat-notrun'].forEach(function(id) {
+            var cb = document.getElementById(id);
+            if (cb) cb.checked = false;
+        });
+        if (typeof updatePromoRerunState === 'function') updatePromoRerunState();
+    } catch (_) { /* keep going */ }
+
     // Row selection counts as "something to clear". Inlined so we don't fire
     // selectByCategory's "Selection cleared" toast on top of a quiet filter reset.
     try {
@@ -388,12 +426,19 @@ function resetDashboardState() {
 
     appState.expandedRows.clear();
 
-    // Drop promotion/release validation state.
+    // Drop promotion/release validation state — including the promo-cat
+    // checkboxes inside the panel, otherwise their stale ticks survive the
+    // clear and the bulk-rerun button thinks a scope is still active.
     var promoInput = document.getElementById('promotion-datetime');
     if (promoInput) promoInput.value = '';
     appState.promotionTime = null;
+    ['promo-cat-failed', 'promo-cat-notrun'].forEach(function(id) {
+        var cb = document.getElementById(id);
+        if (cb) cb.checked = false;
+    });
     if (typeof clearValidationCache === 'function') clearValidationCache();
     applyPromotionTime();
+    if (typeof updatePromoRerunState === 'function') updatePromoRerunState();
 
     // Cancel pending debounce/RAF timers so they don't fire against the wiped state.
     if (_searchDebounce) {

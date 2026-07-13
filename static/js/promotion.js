@@ -150,6 +150,7 @@ function setPromoQuick(minutesAgo) {
 //  Pending-state: track unapplied datetime edits so the Apply button shows 
 
 var _appliedPromoValue = '';
+var _lastPromoWarnStamp = '';
 
 function markPromoPending() {
     var input = document.getElementById('promotion-datetime');
@@ -181,7 +182,7 @@ function confirmPromoApply() {
 // Bucket every job by regression status and aggregate test metrics
 // per bucket. Buckets contain JOB-ID strings (not job objects) — callers
 // resolve to records via appState.jobs.get(id).
-function evaluateRegressionCategories(promotionTime) {
+function evaluateRegressionCategories(promotionTime, jobIdScope) {
     const _zeroTests = () => ({ total: 0, passed: 0, failed: 0, skipped: 0, errors: 0 });
     const result = {
         passed: [], failed: [], not_executed: [], in_progress: [],
@@ -195,7 +196,14 @@ function evaluateRegressionCategories(promotionTime) {
     };
     if (!promotionTime) return result;
 
+    // Optional scope (Set or Array) — when set, iterate only those job IDs
+    // so callers like Copy Release Summary can honour the current filter.
+    const scopeSet = jobIdScope
+        ? (jobIdScope instanceof Set ? jobIdScope : new Set(jobIdScope))
+        : null;
+
     appState.jobs.forEach((job, jobId) => {
+        if (scopeSet && !scopeSet.has(jobId)) return;
         const rs = deriveRegressionStatus(job, promotionTime);
         result[rs].push(jobId);
         result.total++;
@@ -226,8 +234,29 @@ function applyPromotionTime() {
     var input = document.getElementById('promotion-datetime');
     _appliedPromoValue = input ? input.value : '';
 
-    if (promotionTime && promotionTime.getTime() > Date.now() && typeof showToast === 'function') {
-        showToast('Promotion time is in the future — every job will show as Pending until a build runs after it.', 'warning');
+    // De-dupe the warning toasts so env switches / restored views don't
+    // re-fire the same message every call. Track last-warned value+kind.
+    if (promotionTime && typeof showToast === 'function') {
+        const delta = promotionTime.getTime() - Date.now();
+        const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+        let kind = null, msg = null;
+        if (delta > 0) {
+            kind = 'future';
+            msg = 'Promotion time is in the future — every job will show as Pending until a build runs after it.';
+        } else if (-delta > THIRTY_DAYS) {
+            kind = 'past';
+            const days = Math.round(-delta / (24 * 60 * 60 * 1000));
+            msg = `Promotion time is ${days} days in the past — most jobs will show as Validated. Is this the date you meant?`;
+        }
+        if (kind) {
+            const stamp = kind + '|' + (_appliedPromoValue || '');
+            if (_lastPromoWarnStamp !== stamp) {
+                _lastPromoWarnStamp = stamp;
+                showToast(msg, 'warning');
+            }
+        } else {
+            _lastPromoWarnStamp = '';
+        }
     }
 
     _persistCurrentEnvValue(_appliedPromoValue);
@@ -241,10 +270,13 @@ function applyPromotionTime() {
 
     // Release Status filter dropdown visibility tracks the column.
     var releaseFilter = document.getElementById('filter-release-status');
-    // Auto-expand the collapsible Release Validation panel
+    // Auto-expand the collapsible Release Validation panel, but NOT when the
+    // promotion is in the future — that view shows every job as Needs Run,
+    // which would mislead the user into rerunning the whole release.
     var promoPanel = document.getElementById('promo-panel');
+    var isFuture = promotionTime && promotionTime.getTime() > Date.now();
     if (promoPanel && !promoPanel.dataset.userToggled) {
-        promoPanel.open = !!promotionTime;
+        promoPanel.open = !!promotionTime && !isFuture;
     }
     if (promotionTime) {
         table.classList.add('promotion-active');
@@ -313,14 +345,19 @@ function _recomputeReleaseStatusForJob(job, promotionTime) {
 
     let hasPostPromo = false;
     let hasPass = false;
+    let hasFinishedFailure = false;  // any post-promo build that's done AND not SUCCESS
     pool.forEach(b => {
         if (b.timestamp <= promotionTime) return;
         hasPostPromo = true;
         if (b.status === 'SUCCESS') hasPass = true;
+        else if (b.status !== 'IN_PROGRESS') hasFinishedFailure = true;
     });
 
     if (!hasPostPromo) return 'PENDING';
-    return hasPass ? 'PASS' : 'FAIL';
+    if (hasPass) return 'PASS';
+    // Only call it FAIL when there's a completed non-success build. A job
+    // whose only post-promo activity is still IN_PROGRESS is PENDING, not FAIL.
+    return hasFinishedFailure ? 'FAIL' : 'PENDING';
 }
 
 function _recomputeAllReleaseStatusInPlace(promotionTime) {
@@ -351,9 +388,15 @@ function buildReleaseSummary() {
     const promo = appState.promotionTime;
     if (!promo) return null;
 
+    // Honour the same scope as every other ops button — copy summary should
+    // reflect what the release manager sees on screen, not the full dataset.
+    const scope = (typeof getActionScope === 'function') ? getActionScope() : null;
+    const scoped = scope && scope.label !== 'all';
+    const jobIdScope = scoped ? scope.jobIds : null;
+
     // Buckets contain JOB-ID strings — resolve to job records via appState.jobs.
     const cats = (typeof evaluateRegressionCategories === 'function')
-        ? evaluateRegressionCategories(new Date(promo))
+        ? evaluateRegressionCategories(new Date(promo), jobIdScope)
         : null;
     if (!cats) return null;
 
@@ -417,6 +460,11 @@ function buildReleaseSummary() {
     const text = [];
     text.push(`*Release Summary - ${promoStr}*`);
     text.push(`${pct}% ready (${passedIds.length} of ${total} jobs)`);
+    // Make the scope explicit so the reader knows this is filtered, not full.
+    if (scoped) {
+        const scopeWord = scope.label === 'selected' ? 'selected' : 'filtered';
+        text.push(`_Scope: ${scope.count} ${scopeWord} job${scope.count === 1 ? '' : 's'} (from ${scope.totalCount} total)_`);
+    }
     text.push('');
     text.push('*Status*');
     text.push(`• Passed: ${passedIds.length}`);
@@ -581,7 +629,11 @@ function updatePromotionPanel(promotionTime) {
         return;
     }
 
-    const cats = evaluateRegressionCategories(promotionTime);
+    // Honour the selection/filter scope so panel counts match Copy Summary
+    // and the KPI strip — screen must not contradict itself.
+    const _scope = (typeof getActionScope === 'function') ? getActionScope() : null;
+    const _scopeIds = _scope ? _scope.jobIds : null;
+    const cats = evaluateRegressionCategories(promotionTime, _scopeIds);
 
     // Helper writes the same count into both chip sets so the summary
     function _setBoth(idHead, idBody, value) {
@@ -645,11 +697,21 @@ function updatePromoRerunState() {
     const cbFailed = document.getElementById('promo-cat-failed');
     const btn = document.getElementById('promo-rerun-btn');
     const anySelected = (cbNotRun && cbNotRun.checked) || (cbFailed && cbFailed.checked);
-    btn.disabled = !anySelected;
+    const pt = getPromotionTime();
+    const isFuture = pt && pt.getTime() > Date.now();
+    btn.disabled = !anySelected || isFuture;
+    btn.title = isFuture
+        ? 'Promotion time is in the future — set it to a past time before triggering reruns.'
+        : '';
 
-    if (anySelected) {
-        const pt = getPromotionTime();
-        const cats = evaluateRegressionCategories(pt);
+    if (isFuture) {
+        btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>'
+            + 'Set promotion in the past to rerun';
+    } else if (anySelected) {
+        // Scope-aware count so the button label matches what the rerun will actually do.
+        const _scope = (typeof getActionScope === 'function') ? getActionScope() : null;
+        const _scopeIds = _scope ? _scope.jobIds : null;
+        const cats = evaluateRegressionCategories(pt, _scopeIds);
         let count = 0;
         if (cbNotRun && cbNotRun.checked) count += cats.not_executed.length;
         if (cbFailed && cbFailed.checked) count += cats.failed.length;
@@ -666,7 +728,12 @@ function triggerRegressionRerun() {
     const pt = getPromotionTime();
     if (!pt) return;
 
-    const cats = evaluateRegressionCategories(pt);
+    // Scope-aware so a selection or filter narrows which jobs actually get rerun.
+    // The button label already reflects this count via updatePromoRerunState.
+    const scope = (typeof getActionScope === 'function') ? getActionScope() : null;
+    const scopeIds = scope ? scope.jobIds : null;
+    const cats = evaluateRegressionCategories(pt, scopeIds);
+
     const cbNotRun = document.getElementById('promo-cat-notrun');
     const cbFailed = document.getElementById('promo-cat-failed');
     const jobIds = [];

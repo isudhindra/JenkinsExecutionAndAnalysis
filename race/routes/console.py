@@ -78,6 +78,9 @@ def get_console_log():
             },
         )
     except JenkinsClientError as e:
-        return jsonify({"error": safe_err(e)}), 502
+        # Upstream Jenkins 401 → 401 (no X-RACE-Auth-Error) so the browser
+        # shows the amber credential-expired banner, not the red local one.
+        from race.lib.security import upstream_jenkins_error_response
+        return upstream_jenkins_error_response(e, default_status=502)
     except Exception as e:
         return jsonify({"error": safe_err(e)}), 500

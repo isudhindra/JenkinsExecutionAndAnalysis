@@ -206,7 +206,11 @@ function toggleKpiLayout() {
 // Render the Release Validation KPI panel.
 function updateRegressionKPI(promotionTime) {
     if (!promotionTime) return;
-    const cats = evaluateRegressionCategories(promotionTime);
+    // Honour selection/filter scope so this panel matches Copy Summary and
+    // the promo chip strip.
+    const scope = (typeof getActionScope === 'function') ? getActionScope() : null;
+    const scopeIds = scope ? scope.jobIds : null;
+    const cats = evaluateRegressionCategories(promotionTime, scopeIds);
 
     // Test-case totals (mirrors the Jobs Health panel layout).
     const t = cats.tests;

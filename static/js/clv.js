@@ -471,6 +471,23 @@ function clvActivateAnalysis() {
 
     // Arm the idle timer now that the log is fully loaded and visible.
     clvMarkActive();
+
+    // Track ALL user interaction with the panel, not just scroll — pure-read
+    // users who hover/move the mouse should also be considered active.
+    const panel = document.getElementById('clv-overlay') || document.querySelector('.clv-modal') || document.body;
+    if (panel && !panel.dataset.clvActivityBound) {
+        panel.dataset.clvActivityBound = '1';
+        let _throttle = 0;
+        const onAct = () => {
+            const now = Date.now();
+            if (now - _throttle < 200) return;   // throttle to ~5/s
+            _throttle = now;
+            clvMarkActive();
+        };
+        ['mousemove', 'keydown', 'scroll', 'wheel', 'pointerdown', 'focusin'].forEach(ev => {
+            panel.addEventListener(ev, onAct, { passive: true });
+        });
+    }
 }
 
 // Line classifier rules
@@ -569,6 +586,8 @@ const CLV_PATTERNS = [
     { id: 'gen-step-marker',   cls: 'stage',      re: /^Step\s+\d+\s*(\/\s*\d+)?\s*:/i, framework: 'generic' },
 ];
 
+// Noise list + clvIsErrorNoise live in utils.js — extend there, not here.
+
 // Classify a single console-log line. A leading [LEVEL] prefix wins;
 // otherwise CLV_PATTERNS is checked in order with first-match semantics.
 function clvClassifyLine(text) {
@@ -576,7 +595,7 @@ function clvClassifyLine(text) {
     if (prefixMatch) {
         const level = prefixMatch[1].toUpperCase();
         if (level === 'ERROR' || level === 'FATAL' || level === 'SEVERE') {
-            return 'error';
+            return clvIsErrorNoise(text) ? 'plain' : 'error';
         }
         if (level === 'WARN' || level === 'WARNING') return 'warn';
         // INFO / DEBUG / TRACE — never an error regardless of body content.
@@ -584,7 +603,11 @@ function clvClassifyLine(text) {
     }
 
     for (let i = 0; i < CLV_PATTERNS.length; i++) {
-        if (CLV_PATTERNS[i].re.test(text)) return CLV_PATTERNS[i].cls;
+        if (CLV_PATTERNS[i].re.test(text)) {
+            const cls = CLV_PATTERNS[i].cls;
+            if (cls === 'error' && clvIsErrorNoise(text)) return 'plain';
+            return cls;
+        }
     }
     return 'plain';
 }
